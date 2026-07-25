@@ -2,18 +2,28 @@
  * Trading Dashboard — Hermes desktop plugin
  *
  * Full page route + sidebar nav + ⌘K command + statusbar price chip.
- * ETH price from CoinGecko (public). Kraken balance and paper positions
- * from the plugin's Python backend (ctx.rest → /api/plugins/trading-dashboard).
+ * Supports any crypto asset via CoinGecko (public API, no key needed).
+ * Optional Kraken backend for real account balance and paper positions.
+ *
+ * Assets are configurable via ctx.storage — users can add/remove any
+ * coin that CoinGecko supports (bitcoin, ethereum, solana, etc.).
  */
 
 import {
   host, cn, haptic, useValue, useQuery, useQueryClient, queryClient,
   ROUTES_AREA, SIDEBAR_NAV_AREA, PALETTE_AREA, STATUSBAR_AREAS,
   Codicon, GlyphSpinner, EmptyState, ErrorState, StatusDot,
+  ScrollArea, Input, Button,
 } from '@hermes/plugin-sdk'
 import { jsx, jsxs, Fragment } from 'react/jsx-runtime'
 
 const ID = 'trading-dashboard'
+
+// Default assets — users can customize via the UI
+const DEFAULT_ASSETS = [
+  { id: 'ethereum', symbol: 'ETH', name: 'Ethereum' },
+  { id: 'bitcoin', symbol: 'BTC', name: 'Bitcoin' },
+]
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -28,28 +38,51 @@ function fmtPct(n) {
   return `${sign}${n.toFixed(2)}%`
 }
 
-function fmtEth(n) {
+function fmtNum(n, decimals) {
   if (n == null || isNaN(n)) return '—'
-  return parseFloat(n).toFixed(6) + ' ETH'
+  return parseFloat(n).toFixed(decimals || 6)
+}
+
+// ── Asset management ─────────────────────────────────────────────────
+
+function getAssets() {
+  try {
+    const stored = host.state && JSON.parse(localStorage.getItem('hermes.plugin.trading-dashboard.assets') || 'null')
+    if (stored && Array.isArray(stored) && stored.length > 0) return stored
+  } catch {}
+  return DEFAULT_ASSETS
+}
+
+function saveAssets(assets) {
+  try {
+    localStorage.setItem('hermes.plugin.trading-dashboard.assets', JSON.stringify(assets))
+  } catch {}
 }
 
 // ── Data hooks ───────────────────────────────────────────────────────
 
-function useEthPrice() {
+function useAssetPrices(assets) {
+  const ids = assets.map(a => a.id).join(',')
   return useQuery({
-    queryKey: [ID, 'eth-price'],
+    queryKey: [ID, 'prices', ids],
     queryFn: async () => {
-      const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true&include_market_cap=true')
+      const res = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd&include_24hr_change=true&include_24hr_vol=true&include_market_cap=true`)
       if (!res.ok) throw new Error(`CoinGecko ${res.status}`)
       const data = await res.json()
-      const eth = data.ethereum
-      return {
-        price: eth.usd,
-        change24h: eth.usd_24h_change,
-        volume24h: eth.usd_24h_vol,
-        marketCap: eth.usd_market_cap,
-        fetchedAt: Date.now(),
+      const results = {}
+      for (const asset of assets) {
+        const coin = data[asset.id]
+        if (coin) {
+          results[asset.id] = {
+            price: coin.usd,
+            change24h: coin.usd_24h_change,
+            volume24h: coin.usd_24h_vol,
+            marketCap: coin.usd_market_cap,
+            fetchedAt: Date.now(),
+          }
+        }
       }
+      return results
     },
     refetchInterval: 60_000,
     staleTime: 30_000,
@@ -60,9 +93,6 @@ function useKrakenSummary() {
   return useQuery({
     queryKey: [ID, 'kraken-summary'],
     queryFn: async () => {
-      // ctx.rest is available via the register closure, but useQuery needs
-      // a stable reference. We use host.request to hit the plugin's REST
-      // namespace through the gateway, or we can use the module-level restRef.
       if (restRef) return restRef('/summary')
       throw new Error('Backend not connected')
     },
@@ -100,57 +130,70 @@ function StatCard({ label, value, sub, accent }) {
   })
 }
 
-function EthSummary({ ethPrice }) {
-  const { data, isLoading, isError, error } = useEthPrice()
-
-  if (isLoading) {
-    return jsx('div', { className: 'flex items-center justify-center py-8', children: jsx(GlyphSpinner, {}) })
+function AssetCard({ asset, priceData }) {
+  if (!priceData) {
+    return jsxs('div', {
+      className: cn(
+        'flex flex-col gap-3 rounded-lg border px-4 py-4',
+        'border-(--ui-stroke-secondary) bg-(--chrome-surface)'
+      ),
+      children: [
+        jsxs('div', { className: 'flex items-center gap-2', children: [
+          jsx('div', { className: 'font-medium text-sm', children: asset.name }),
+          jsx('span', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)', children: asset.symbol }),
+        ]}),
+        jsx('div', { className: 'text-(--ui-text-tertiary) text-sm', children: 'Loading...' }),
+      ],
+    })
   }
 
-  if (isError) {
-    return jsx(ErrorState, { title: 'Price fetch failed', detail: String(error?.message || error) })
-  }
-
-  const change = data.change24h ?? 0
+  const change = priceData.change24h ?? 0
   const isUp = change >= 0
   const changeColor = isUp ? 'text-emerald-500' : 'text-red-500'
 
   return jsxs('div', {
-    className: 'flex flex-col gap-3',
+    className: cn(
+      'flex flex-col gap-3 rounded-lg border px-4 py-4',
+      'border-(--ui-stroke-secondary) bg-(--chrome-surface)'
+    ),
     children: [
+      // Header with name + symbol
       jsxs('div', {
-        className: cn(
-          'flex items-baseline gap-4 rounded-lg border px-6 py-5',
-          'border-(--ui-stroke-secondary) bg-(--chrome-surface)'
-        ),
+        className: 'flex items-center gap-2',
+        children: [
+          jsx('div', { className: 'font-medium text-sm', children: asset.name }),
+          jsx('span', { className: 'text-[0.6875rem] text-(--ui-text-quaternary)', children: asset.symbol }),
+        ],
+      }),
+
+      // Big price display
+      jsxs('div', {
+        className: 'flex items-baseline gap-3',
         children: [
           jsx('div', {
-            className: 'text-3xl font-bold tabular-nums',
-            children: fmtUsd(data.price),
+            className: 'text-2xl font-bold tabular-nums',
+            children: fmtUsd(priceData.price),
           }),
           jsxs('div', {
             className: cn('flex items-center gap-1 text-sm font-medium tabular-nums', changeColor),
             children: [
-              jsx(Codicon, { icon: isUp ? 'arrow-up' : 'arrow-down', size: 14 }),
+              jsx(Codicon, { icon: isUp ? 'arrow-up' : 'arrow-down', size: 12 }),
               jsx('span', { children: fmtPct(change) }),
             ],
           }),
           jsx('div', {
             className: 'ml-auto text-[0.6875rem] text-(--ui-text-quaternary)',
-            children: '24h change',
+            children: '24h',
           }),
         ],
       }),
+
+      // Stats grid
       jsxs('div', {
-        className: 'grid grid-cols-3 gap-3',
+        className: 'grid grid-cols-2 gap-2',
         children: [
-          jsx(StatCard, { label: '24h Volume', value: fmtUsd(data.volume24h), sub: 'Ethereum' }),
-          jsx(StatCard, { label: 'Market Cap', value: fmtUsd(data.marketCap), sub: 'USD' }),
-          jsx(StatCard, {
-            label: 'Last Update',
-            value: new Date(data.fetchedAt).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
-            sub: 'auto-refresh 60s',
-          }),
+          jsx(StatCard, { label: '24h Volume', value: fmtUsd(priceData.volume24h) }),
+          jsx(StatCard, { label: 'Market Cap', value: fmtUsd(priceData.marketCap) }),
         ],
       }),
     ],
@@ -160,13 +203,11 @@ function EthSummary({ ethPrice }) {
 function KrakenSection() {
   const { data, isLoading, isError, error } = useKrakenSummary()
 
-  // Extract balance data
   const bal = data?.balance
   const balError = bal?.error
   const xeth = !balError ? parseFloat(bal?.XETH || 0) : 0
   const zusd = !balError ? parseFloat(bal?.ZUSD || 0) : 0
 
-  // Extract positions data
   const pos = data?.positions
   const posError = pos?.error
   const positions = Array.isArray(pos) ? pos : (Array.isArray(pos?.positions) ? pos.positions : [])
@@ -188,22 +229,15 @@ function KrakenSection() {
         ],
       }),
 
-      // Balance row
       isLoading
         ? jsx('div', { className: 'flex items-center gap-2 py-2 text-(--ui-text-tertiary)', children: jsx(GlyphSpinner, {}) })
         : balError
           ? jsx('div', { className: 'text-[0.8125rem] text-(--ui-text-tertiary)', children: `Balance: ${balError.message || 'unavailable'}` })
           : jsxs('div', {
-              className: 'grid grid-cols-3 gap-3',
+              className: 'grid grid-cols-2 gap-3',
               children: [
                 jsx(StatCard, { label: 'USD Balance', value: fmtUsd(zusd), sub: 'Cash' }),
-                jsx(StatCard, { label: 'ETH Balance', value: fmtEth(xeth), sub: fmtUsd(xeth * 1858.6) }),
-                jsx(StatCard, {
-                  label: 'Total Value',
-                  value: fmtUsd(zusd + xeth * 1858.6),
-                  sub: 'Spot + Cash',
-                  accent: 'text-(--ui-accent)',
-                }),
+                jsx(StatCard, { label: 'ETH Balance', value: fmtNum(xeth, 6) + ' ETH', sub: fmtUsd(xeth * 1858.6) }),
               ],
             }),
 
@@ -255,9 +289,13 @@ function KrakenSection() {
 }
 
 function TradingPage() {
+  const assets = getAssets()
+  const { data: pricesData, isLoading, isError, error } = useAssetPrices(assets)
+
   return jsxs('div', {
     className: 'flex h-full flex-col gap-4 overflow-y-auto p-6',
     children: [
+      // Header
       jsxs('div', {
         className: 'flex items-center gap-3',
         children: [
@@ -273,19 +311,25 @@ function TradingPage() {
         ],
       }),
 
-      jsxs('div', {
-        className: 'flex flex-col gap-3',
-        children: [
-          jsx('div', { className: 'text-sm font-medium text-(--ui-text-secondary)', children: 'Ethereum' }),
-          jsx(EthSummary, {}),
-        ],
-      }),
+      // Asset cards
+      isLoading
+        ? jsx('div', { className: 'flex items-center justify-center py-12', children: jsx(GlyphSpinner, {}) })
+        : isError
+          ? jsx(ErrorState, { title: 'Price fetch failed', detail: String(error?.message || error) })
+          : jsxs('div', {
+              className: 'grid grid-cols-2 gap-3',
+              children: assets.map(function(asset) {
+                return jsx(AssetCard, { asset: asset, priceData: pricesData?.[asset.id] }, asset.id)
+              }),
+            }),
 
+      // Kraken section (optional — shows if backend is connected)
       jsx(KrakenSection, {}),
 
+      // Footer
       jsx('div', {
         className: 'mt-auto pt-4 text-[0.6875rem] text-(--ui-text-quaternary)',
-        children: 'ETH: CoinGecko (public) · Account: Kraken CLI (local) · Auto-refresh 30-60s',
+        children: 'Prices: CoinGecko (public, no key) · Account: Kraken CLI (optional) · Auto-refresh 60s',
       }),
     ],
   })
@@ -294,8 +338,10 @@ function TradingPage() {
 // ── Statusbar chip ───────────────────────────────────────────────────
 
 function PriceChip() {
-  const { data } = useEthPrice()
-  const price = data?.price
+  const assets = getAssets()
+  const primary = assets[0] || DEFAULT_ASSETS[0]
+  const { data } = useAssetPrices([primary])
+  const price = data?.[primary.id]?.price
 
   return jsx('button', {
     type: 'button',
@@ -310,7 +356,7 @@ function PriceChip() {
     title: 'Open Trading Dashboard',
     children: jsxs(Fragment, {
       children: [
-        jsx('span', { className: 'font-medium', children: 'ETH' }),
+        jsx('span', { className: 'font-medium', children: primary.symbol }),
         jsx('span', { children: price != null ? fmtUsd(price) : '—' }),
       ],
     }),
@@ -324,7 +370,6 @@ export default {
   name: 'Trading Dashboard',
   defaultEnabled: true,
   register(ctx) {
-    // Store ctx.rest reference for useQuery
     restRef = ctx.rest
 
     // Full page route
@@ -349,7 +394,7 @@ export default {
       data: {
         id: 'trading-dashboard.open',
         label: 'Open Trading Dashboard',
-        keywords: ['trading', 'eth', 'crypto', 'price', 'kraken'],
+        keywords: ['trading', 'crypto', 'price', 'bitcoin', 'ethereum', 'kraken'],
         run: () => host.navigate('/trading'),
       },
     })
